@@ -1,0 +1,639 @@
+openapi: 3.0.3
+info:
+  title: Checkout and Rewards Service
+  version: 1.0.0
+  description: |
+    Carts, idempotent checkout, inventory protection, milestone coupons and
+    admin reporting.
+
+    **Money**: every amount is an integer in the currency's minor unit
+    (`*Cents`). No floats anywhere.
+
+    **Errors**: every non-2xx response has the shape
+    `{ "error": { "code", "message", "details"? } }`. `code` is stable and is
+    the field clients should branch on.
+
+    **Administrative operations** live under `/admin/*`. No authentication is
+    implemented (explicitly out of scope); in production that router sits
+    behind an admin-role check.
+
+    **Idempotency**: `POST /carts/{cartId}/checkout` uses the cart as the
+    idempotency key. The first success returns `201`; an equivalent retry
+    returns `200` with the same order and header `Idempotent-Replayed: true`.
+
+servers:
+  - url: http://localhost:3000
+
+tags:
+  - name: Products
+  - name: Carts
+  - name: Checkout
+  - name: Orders
+  - name: Admin
+    description: Privileged operations (no auth implemented).
+
+paths:
+  /health:
+    get:
+      summary: Liveness check
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example: { status: ok }
+
+  /products:
+    get:
+      tags: [Products]
+      summary: List catalogue with live prices and inventory
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  products:
+                    type: array
+                    items: { $ref: "#/components/schemas/Product" }
+
+  /products/{productId}:
+    get:
+      tags: [Products]
+      summary: Get a product
+      parameters: [{ $ref: "#/components/parameters/productId" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Product" }
+        "404": { $ref: "#/components/responses/ProductNotFound" }
+
+  /carts:
+    post:
+      tags: [Carts]
+      summary: Create an empty cart
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Cart" }
+
+  /carts/{cartId}:
+    get:
+      tags: [Carts]
+      summary: View a cart with live prices, line totals, subtotal and stock warnings
+      parameters: [{ $ref: "#/components/parameters/cartId" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Cart" }
+        "404": { $ref: "#/components/responses/CartNotFound" }
+
+  /carts/{cartId}/items:
+    post:
+      tags: [Carts]
+      summary: Add a product to the cart (merges with an existing line)
+      description: |
+        If the product is already in the cart, quantities are added together.
+        The combined quantity must be fulfillable by current inventory
+        (early feedback only; nothing is reserved until checkout).
+      parameters: [{ $ref: "#/components/parameters/cartId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [productId, quantity]
+              additionalProperties: false
+              properties:
+                productId: { type: string, example: prod-tshirt }
+                quantity: { type: integer, minimum: 1, maximum: 999, example: 2 }
+      responses:
+        "201":
+          description: Item added; returns the updated cart
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Cart" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "404": { $ref: "#/components/responses/CartNotFound" }
+        "409":
+          description: Cart already checked out, or quantity exceeds inventory
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                insufficientInventory: { $ref: "#/components/examples/InsufficientInventory" }
+                checkedOut: { $ref: "#/components/examples/CartAlreadyCheckedOut" }
+        "422":
+          description: Product referenced in the body does not exist
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                error: { code: PRODUCT_NOT_FOUND, message: Product nope does not exist, details: { productId: nope } }
+
+  /carts/{cartId}/items/{productId}:
+    put:
+      tags: [Carts]
+      summary: Set the quantity of an existing cart line
+      parameters:
+        - { $ref: "#/components/parameters/cartId" }
+        - { $ref: "#/components/parameters/productId" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [quantity]
+              additionalProperties: false
+              properties:
+                quantity: { type: integer, minimum: 1, maximum: 999 }
+      responses:
+        "200":
+          description: Updated cart
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Cart" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "404":
+          description: Cart or cart line not found (`CART_NOT_FOUND` / `CART_ITEM_NOT_FOUND`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: Cart already checked out, or quantity exceeds inventory
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      tags: [Carts]
+      summary: Remove a line from the cart
+      parameters:
+        - { $ref: "#/components/parameters/cartId" }
+        - { $ref: "#/components/parameters/productId" }
+      responses:
+        "200":
+          description: Updated cart
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Cart" }
+        "404":
+          description: Cart or cart line not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: Cart already checked out
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /carts/{cartId}/checkout:
+    post:
+      tags: [Checkout]
+      summary: Check out a cart, optionally redeeming a coupon
+      description: |
+        Atomically validates the cart against live inventory, decrements stock,
+        redeems the coupon (if any), snapshots prices into an order and closes
+        the cart. All or nothing: a failure for any reason leaves inventory,
+        coupon and cart exactly as they were.
+
+        Retries: a cart can be checked out once. Repeating the same request
+        (same `couponCode`, or none) returns the existing order with `200` and
+        `Idempotent-Replayed: true`. Repeating with a *different* coupon is
+        rejected with `409 CART_ALREADY_CHECKED_OUT` (details include the
+        existing `orderId`).
+      parameters: [{ $ref: "#/components/parameters/cartId" }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                couponCode:
+                  type: string
+                  nullable: true
+                  description: Case-insensitive; surrounding whitespace is trimmed.
+                  example: SAVE10-M1-7F2A9C
+      responses:
+        "201":
+          description: Order placed
+          headers:
+            Location: { schema: { type: string }, description: URL of the new order }
+            Idempotent-Replayed: { schema: { type: string, enum: ["false"] } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "200":
+          description: Idempotent replay — the cart was already checked out by an equivalent request
+          headers:
+            Idempotent-Replayed: { schema: { type: string, enum: ["true"] } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "404": { $ref: "#/components/responses/CartNotFound" }
+        "409":
+          description: |
+            `INSUFFICIENT_INVENTORY` (details list every short line),
+            `COUPON_ALREADY_REDEEMED`, or `CART_ALREADY_CHECKED_OUT` (retry with different terms).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                insufficientInventory: { $ref: "#/components/examples/InsufficientInventory" }
+                couponAlreadyRedeemed:
+                  value:
+                    error:
+                      code: COUPON_ALREADY_REDEEMED
+                      message: Coupon SAVE10-M1-7F2A9C has already been redeemed
+                      details: { couponCode: SAVE10-M1-7F2A9C }
+                checkedOut: { $ref: "#/components/examples/CartAlreadyCheckedOut" }
+        "422":
+          description: "`CART_EMPTY` or `COUPON_INVALID` (unknown code)"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                cartEmpty:
+                  value:
+                    error: { code: CART_EMPTY, message: "Cart ... has no items; nothing to check out", details: { cartId: "..." } }
+                couponInvalid:
+                  value:
+                    error: { code: COUPON_INVALID, message: Coupon BOGUS does not exist, details: { couponCode: BOGUS } }
+
+  /orders/{orderId}:
+    get:
+      tags: [Orders]
+      summary: Retrieve an order (immutable snapshot)
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "404":
+          description: ORDER_NOT_FOUND
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /admin/coupons:
+    post:
+      tags: [Admin]
+      summary: Generate a coupon for the lowest unrewarded milestone
+      description: |
+        Milestone *k* is eligible once `k × n` orders have been placed. One
+        coupon is generated per call; the response reports how many eligible
+        milestones remain. Safe to call repeatedly — it fails with `409` rather
+        than over-generating.
+      responses:
+        "201":
+          description: Coupon generated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  coupon: { $ref: "#/components/schemas/Coupon" }
+                  milestones: { $ref: "#/components/schemas/MilestoneStatus" }
+        "409":
+          description: MILESTONE_NOT_REACHED — every reached milestone already has a coupon
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                error:
+                  code: MILESTONE_NOT_REACHED
+                  message: No unrewarded order milestone has been reached yet
+                  details:
+                    everyNOrders: 5
+                    discountPercent: 10
+                    totalOrders: 7
+                    milestonesReached: 1
+                    couponsGenerated: 1
+                    unrewardedMilestones: 0
+                    ordersUntilNextMilestone: 3
+    get:
+      tags: [Admin]
+      summary: List all coupons with milestone status
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  coupons:
+                    type: array
+                    items: { $ref: "#/components/schemas/Coupon" }
+                  milestones: { $ref: "#/components/schemas/MilestoneStatus" }
+
+  /admin/coupons/{code}:
+    get:
+      tags: [Admin]
+      summary: Get a coupon
+      parameters:
+        - name: code
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Coupon" }
+        "422":
+          description: COUPON_INVALID
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /admin/orders:
+    get:
+      tags: [Admin]
+      summary: List all orders (for reconciliation with the report)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  orders:
+                    type: array
+                    items: { $ref: "#/components/schemas/Order" }
+
+  /admin/report:
+    get:
+      tags: [Admin]
+      summary: Sales and coupon summary (read-only; never mutates state)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Report" }
+
+  /admin/products/{productId}:
+    patch:
+      tags: [Admin]
+      summary: Change a product's price and/or absolute inventory
+      description: |
+        Provided to demonstrate how carts and orders behave when the catalogue
+        changes. Existing orders are unaffected (they hold snapshots); open
+        carts see the new values on their next read and at checkout.
+      parameters: [{ $ref: "#/components/parameters/productId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                unitPriceCents: { type: integer, minimum: 0 }
+                inventory: { type: integer, minimum: 0 }
+      responses:
+        "200":
+          description: Updated product
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Product" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "404": { $ref: "#/components/responses/ProductNotFound" }
+
+components:
+  parameters:
+    cartId:
+      name: cartId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    productId:
+      name: productId
+      in: path
+      required: true
+      schema: { type: string }
+
+  responses:
+    ValidationError:
+      description: Malformed request (VALIDATION_ERROR). `details.issues` lists each problem.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error:
+              code: VALIDATION_ERROR
+              message: Invalid request body
+              details:
+                issues: [{ path: quantity, message: quantity must be an integer }]
+    CartNotFound:
+      description: CART_NOT_FOUND
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ProductNotFound:
+      description: PRODUCT_NOT_FOUND
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  examples:
+    InsufficientInventory:
+      value:
+        error:
+          code: INSUFFICIENT_INVENTORY
+          message: One or more items exceed the available inventory
+          details:
+            items:
+              - { productId: prod-limited, productName: Limited Edition Vinyl, requested: 5, available: 3 }
+    CartAlreadyCheckedOut:
+      value:
+        error:
+          code: CART_ALREADY_CHECKED_OUT
+          message: Cart ... has already been checked out and can no longer be modified
+          details: { cartId: "...", orderId: "..." }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                - VALIDATION_ERROR
+                - NOT_FOUND
+                - CART_NOT_FOUND
+                - CART_ITEM_NOT_FOUND
+                - ORDER_NOT_FOUND
+                - PRODUCT_NOT_FOUND
+                - CART_EMPTY
+                - CART_ALREADY_CHECKED_OUT
+                - INSUFFICIENT_INVENTORY
+                - COUPON_INVALID
+                - COUPON_ALREADY_REDEEMED
+                - MILESTONE_NOT_REACHED
+                - CONFLICT
+                - INTERNAL_ERROR
+            message: { type: string }
+            details: { type: object, additionalProperties: true }
+
+    Product:
+      type: object
+      properties:
+        id: { type: string, example: prod-tshirt }
+        name: { type: string, example: Classic T-Shirt }
+        unitPriceCents: { type: integer, example: 1999 }
+        availableInventory: { type: integer, example: 100 }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    CartItem:
+      type: object
+      properties:
+        productId: { type: string }
+        name: { type: string }
+        unitPriceCents: { type: integer, description: Current catalogue price (not locked) }
+        quantity: { type: integer }
+        lineTotalCents: { type: integer }
+        availableInventory: { type: integer }
+        inStock: { type: boolean, description: false if quantity exceeds current inventory }
+
+    Cart:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        status: { type: string, enum: [ACTIVE, CHECKED_OUT] }
+        currency: { type: string, example: USD }
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/CartItem" }
+        itemCount: { type: integer }
+        subtotalCents: { type: integer }
+        warnings:
+          type: array
+          description: Non-fatal issues that would make checkout fail as-is
+          items:
+            type: object
+            properties:
+              code: { type: string, enum: [INSUFFICIENT_INVENTORY] }
+              productId: { type: string }
+              requested: { type: integer }
+              available: { type: integer }
+        orderId: { type: string, nullable: true, description: Set once checked out }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    OrderItem:
+      type: object
+      description: Snapshot taken at checkout; immune to later catalogue changes
+      properties:
+        productId: { type: string }
+        productName: { type: string }
+        unitPriceCents: { type: integer }
+        quantity: { type: integer }
+        lineTotalCents: { type: integer }
+
+    Order:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        orderNumber: { type: integer, description: 1-based position among successfully placed orders }
+        cartId: { type: string, format: uuid }
+        status: { type: string, enum: [PLACED] }
+        currency: { type: string }
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/OrderItem" }
+        subtotalCents: { type: integer, description: Sum of line totals before discount }
+        discount:
+          type: object
+          nullable: true
+          properties:
+            couponCode: { type: string }
+            percent: { type: integer }
+            amountCents: { type: integer }
+        discountCents: { type: integer }
+        totalCents: { type: integer, description: subtotalCents - discountCents, never negative }
+        createdAt: { type: string, format: date-time }
+
+    Coupon:
+      type: object
+      properties:
+        code: { type: string, example: SAVE10-M1-7F2A9C }
+        milestoneNumber: { type: integer, description: k — rewards the k-th milestone }
+        milestoneOrderNumber: { type: integer, description: k × n }
+        discountPercent: { type: integer }
+        status: { type: string, enum: [AVAILABLE, REDEEMED] }
+        redeemedByOrderId: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+        redeemedAt: { type: string, format: date-time, nullable: true }
+
+    MilestoneStatus:
+      type: object
+      properties:
+        everyNOrders: { type: integer }
+        discountPercent: { type: integer }
+        totalOrders: { type: integer }
+        milestonesReached: { type: integer, description: floor(totalOrders / n) }
+        couponsGenerated: { type: integer }
+        unrewardedMilestones: { type: integer }
+        ordersUntilNextMilestone: { type: integer }
+
+    Report:
+      type: object
+      properties:
+        generatedAt: { type: string, format: date-time }
+        currency: { type: string }
+        orders:
+          type: object
+          properties:
+            totalPlaced: { type: integer }
+        revenue:
+          type: object
+          properties:
+            grossCents: { type: integer, description: Sum of order subtotals before discounts }
+            discountsCents: { type: integer }
+            netCents: { type: integer, description: Always grossCents - discountsCents }
+        purchasedQuantityByProduct:
+          type: array
+          items:
+            type: object
+            properties:
+              productId: { type: string }
+              productName: { type: string }
+              quantity: { type: integer }
+              revenueCents: { type: integer }
+        coupons:
+          type: object
+          properties:
+            generated: { type: integer }
+            available: { type: integer }
+            redeemed: { type: integer }
+        milestones: { $ref: "#/components/schemas/MilestoneStatus" }
